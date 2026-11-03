@@ -110,125 +110,253 @@ def money(v):
     return f"{int(v):,}".replace(",", " ")
 
 
+# ====================== HTTP ======================
+def fetch(url, **kw):
+    r = S.get(url, timeout=30, **kw)
+    print(f"GET {r.status_code} {r.url[:170]}")
+    if not r.ok:
+        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]!r}")
+    return r
+
+
+def page_text(page_html):
+    t = re.sub(r"(?s)<(script|style)[^>]*>.*?</\1>", " ", page_html)
+    return re.sub(r"<[^>]+>", " ", t)
+
+
+def first_working(name, strategies):
+    errs = []
+    for fn in strategies:
+        try:
+            items = fn()
+            if items:
+                print(f"{name}: стратегия {fn.__name__} дала {len(items)} объявлений")
+                return items
+            errs.append(f"{fn.__name__}: 0 объявлений")
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{fn.__name__}: {e}")
+    raise RuntimeError(" | ".join(errs)[:900])
+
+
 # ====================== SREALITY ======================
-def sreality():
+def sr_make(hid, name, locality, price, lat, lon, slug="praha", url=None):
+    m = re.search(r"\d\+(?:kk|\d)", name or "", re.I)
+    disp = m.group(0).lower() if m else ""
+    if disp and disp not in ALLOWED_DISP:
+        return None
+    if isinstance(price, dict):
+        price = price.get("value_raw") or price.get("value")
+    if not isinstance(price, (int, float)) or price <= 0:
+        return None
+    loc = (float(lat), float(lon)) if lat and lon else None
+    if url and url.startswith("/"):
+        url = "https://www.sreality.cz" + url
+    return {
+        "id": f"sr:{hid}", "source": "Sreality", "ref": str(hid),
+        "title": name or "Byt", "locality": locality or "",
+        "price": int(price), "charges": None, "gps": loc,
+        "text": f"{name} {locality}",
+        "url": url or f"https://www.sreality.cz/detail/pronajem/byt/{disp or 'x'}/{slug}/{hid}",
+    }
+
+
+def sreality_api():
+    base = {"category_main_cb": 1, "category_type_cb": 2,
+            "locality_region_id": 10, "per_page": 60}
     items, seen_ids = [], set()
     for page in range(1, MAX_PAGES + 1):
-        r = S.get("https://www.sreality.cz/api/cs/v2/estates", params={
-            "category_main_cb": 1, "category_type_cb": 2,
-            "category_sub_cb": SREALITY_SUBS,
-            "locality_region_id": 10,
-            "czk_price_summary_order2": f"0|{PRICE_FURNISHED}",
-            "per_page": 60, "page": page, "sort": 0,
-        }, timeout=30)
-        r.raise_for_status()
+        full = {**base, "page": page, "category_sub_cb": SREALITY_SUBS,
+                "czk_price_summary_order2": f"0|{PRICE_FURNISHED}"}
+        try:
+            r = fetch("https://www.sreality.cz/api/cs/v2/estates", params=full)
+        except RuntimeError:
+            if page != 1:
+                raise
+            r = fetch("https://www.sreality.cz/api/cs/v2/estates",
+                      params={**base, "page": page})   # без необязательных фильтров
         estates = r.json().get("_embedded", {}).get("estates", [])
         if not estates:
             break
         for e in estates:
-            hid = str(e.get("hash_id"))
+            hid = e.get("hash_id")
             if hid in seen_ids:
                 continue
             seen_ids.add(hid)
-            name = e.get("name", "")
-            m = re.search(r"\d\+(?:kk|\d)", name, re.I)
-            disp = m.group(0).lower() if m else ""
-            if disp and disp not in ALLOWED_DISP:
-                continue
-            price = e.get("price") or (e.get("price_czk") or {}).get("value_raw")
-            if not price:
-                continue
             gps = e.get("gps") or {}
-            loc = (gps["lat"], gps["lon"]) if gps.get("lat") and gps.get("lon") else None
-            slug = (e.get("seo") or {}).get("locality", "praha")
-            items.append({
-                "id": f"sr:{hid}", "source": "Sreality", "ref": hid,
-                "title": name, "locality": e.get("locality", ""),
-                "price": int(price), "charges": None, "gps": loc,
-                "text": name + " " + e.get("locality", ""),
-                "url": f"https://www.sreality.cz/detail/pronajem/byt/{disp or 'x'}/{slug}/{hid}",
-            })
+            it = sr_make(hid, e.get("name", ""), e.get("locality", ""),
+                         e.get("price") or e.get("price_czk"),
+                         gps.get("lat"), gps.get("lon"),
+                         slug=(e.get("seo") or {}).get("locality", "praha"))
+            if it:
+                items.append(it)
         time.sleep(1)
-    if not items:
-        raise RuntimeError("Sreality вернул 0 объявлений (блокировка или изменился API)")
     return items
 
 
-def sreality_detail(item):
-    r = S.get(f"https://www.sreality.cz/api/cs/v2/estates/{item['ref']}", timeout=30)
-    r.raise_for_status()
-    j = r.json()
-    parts = [(j.get("text") or {}).get("value", "")]
-    for it in j.get("items", []):
-        v = it.get("value")
-        if isinstance(v, bool):
-            if v:
-                parts.append(str(it.get("name", "")))
-        else:
-            parts.append(f"{it.get('name', '')} {json.dumps(v, ensure_ascii=False)}")
-    return " ".join(parts)
-
-
-# ====================== BEZREALITKY ======================
-def bezrealitky():
+def sreality_html():
     items, seen_ids = [], set()
-    base = [("offerType", "PRONAJEM"), ("estateType", "BYT"),
-            ("regionOsmIds", "R435514"),
-            ("osm_value", "Praha, Hlavní město Praha, Česko"),
-            ("currency", "CZK"), ("priceTo", PRICE_FURNISHED)]
-    base += [("disposition", d) for d in BEZ_DISPS]
     for page in range(1, MAX_PAGES + 1):
-        r = S.get("https://www.bezrealitky.cz/vyhledavani",
-                  params=base + [("page", page)], timeout=30)
-        r.raise_for_status()
+        r = fetch("https://www.sreality.cz/hledani/pronajem/byty/praha",
+                  params={"cena-do": PRICE_FURNISHED, "strana": page})
         data = next_data(r.text)
-        if data is None:
-            raise RuntimeError("Bezrealitky: не найден __NEXT_DATA__ (блокировка или новая вёрстка)")
+        if not data:
+            raise RuntimeError("в HTML нет __NEXT_DATA__")
         new = 0
         for d in walk(data):
-            if not ("uri" in d and "disposition" in d and "id" in d):
+            hid = d.get("hash_id", d.get("hashId"))
+            if hid is None or hid in seen_ids:
                 continue
-            aid = str(d["id"])
-            if aid in seen_ids:
-                continue
-            seen_ids.add(aid)
+            seen_ids.add(hid)
             new += 1
-            disp = str(d["disposition"]).replace("DISP_", "").replace("_", "+").lower()
-            if disp not in ALLOWED_DISP:
-                continue
-            price = getf(d, "price")
-            if not isinstance(price, (int, float)) or price <= 0:
-                continue
-            gps = getf(d, "gps")
-            loc = None
-            if isinstance(gps, dict):
-                lat, lon = gps.get("lat"), gps.get("lng", gps.get("lon"))
-                if lat and lon:
-                    loc = (float(lat), float(lon))
-            addr = getf(d, "address") or ""
-            surface = getf(d, "surface")
-            title = f"{disp}" + (f" · {surface} м²" if surface else "")
-            charges = getf(d, "charges")
-            items.append({
-                "id": f"bz:{aid}", "source": "Bezrealitky", "ref": d["uri"],
-                "title": title, "locality": addr if isinstance(addr, str) else "",
-                "price": int(price),
-                "charges": int(charges) if isinstance(charges, (int, float)) and charges else None,
-                "gps": loc,
-                "text": " ".join(strings_of(d)),
-                "url": f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{d['uri']}",
-            })
-        if page == 1 and new == 0:
-            raise RuntimeError("Bezrealitky: на странице нет объявлений (изменилась структура?)")
+            loc = d.get("locality")
+            if isinstance(loc, dict):
+                loc = ", ".join(str(v) for v in loc.values() if isinstance(v, str))
+            gps = d.get("gps") if isinstance(d.get("gps"), dict) else {}
+            it = sr_make(hid, d.get("name") or d.get("title") or "", loc or "",
+                         d.get("priceCzk") or d.get("price_czk") or d.get("price"),
+                         gps.get("lat"), gps.get("lon", gps.get("lng")),
+                         url=d.get("url") if isinstance(d.get("url"), str) else None)
+            if it:
+                items.append(it)
         if new == 0:
+            if page == 1:
+                pp = ((data.get("props") or {}).get("pageProps") or {})
+                raise RuntimeError(f"объявления в HTML не найдены (ключи pageProps: {list(pp)[:8]})")
             break
         time.sleep(1)
     return items
 
 
+def sreality():
+    return first_working("Sreality", (sreality_api, sreality_html))
+
+
+def sreality_detail(item):
+    try:
+        j = fetch(f"https://www.sreality.cz/api/cs/v2/estates/{item['ref']}").json()
+        parts = [(j.get("text") or {}).get("value", "")]
+        for it in j.get("items", []):
+            v = it.get("value")
+            if isinstance(v, bool):
+                if v:
+                    parts.append(str(it.get("name", "")))
+            else:
+                parts.append(f"{it.get('name', '')} {json.dumps(v, ensure_ascii=False)}")
+        return " ".join(parts)
+    except Exception as e:  # noqa: BLE001
+        print(f"detail API не сработал ({e}), читаю страницу")
+        return page_text(fetch(item["url"]).text)
+
+
+# ====================== BEZREALITKY ======================
+def bz_item(d):
+    if not ("uri" in d and "disposition" in d and "id" in d):
+        return None
+    disp = str(d["disposition"]).replace("DISP_", "").replace("_", "+").lower()
+    if disp not in ALLOWED_DISP:
+        return None
+    price = getf(d, "price")
+    if not isinstance(price, (int, float)) or price <= 0:
+        return None
+    gps = getf(d, "gps")
+    loc = None
+    lat = lon = None
+    if isinstance(gps, dict):
+        lat, lon = gps.get("lat"), gps.get("lng", gps.get("lon"))
+    else:
+        lat, lon = d.get("lat"), d.get("lng")
+    if lat and lon:
+        loc = (float(lat), float(lon))
+    addr = getf(d, "address")
+    surface = getf(d, "surface")
+    charges = getf(d, "charges")
+    return {
+        "id": f"bz:{d['id']}", "source": "Bezrealitky", "ref": d["uri"],
+        "title": disp + (f" · {surface} м²" if surface else ""),
+        "locality": addr if isinstance(addr, str) else "",
+        "price": int(price),
+        "charges": int(charges) if isinstance(charges, (int, float)) and charges else None,
+        "gps": loc,
+        "text": " ".join(strings_of(d)),
+        "url": f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{d['uri']}",
+    }
+
+
+def bezrealitky_graphql():
+    items, seen_ids = [], set()
+    disp = ", ".join(BEZ_DISPS)
+    for page in range(MAX_PAGES):
+        q = ("query { listAdverts(offerType: PRONAJEM, estateType: BYT, "
+             f"disposition: [{disp}], priceTo: {PRICE_FURNISHED}, "
+             'regionOsmIds: ["R435514"], '
+             f"limit: 60, offset: {page * 60}, order: TIMEORDER_DESC) "
+             "{ totalCount list { id uri disposition surface price charges "
+             "gps { lat lng } address(locale: CS) } } }")
+        r = S.post("https://api.bezrealitky.cz/graphql/", json={"query": q}, timeout=30,
+                   headers={"Origin": "https://www.bezrealitky.cz",
+                            "Referer": "https://www.bezrealitky.cz/"})
+        print(f"POST {r.status_code} graphql page {page + 1}")
+        if not r.ok:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:250]!r}")
+        j = r.json()
+        if j.get("errors"):
+            raise RuntimeError("GraphQL: " + json.dumps(j["errors"], ensure_ascii=False)[:300])
+        lst = (((j.get("data") or {}).get("listAdverts")) or {}).get("list") or []
+        if not lst:
+            break
+        for d in lst:
+            if d.get("id") in seen_ids:
+                continue
+            seen_ids.add(d.get("id"))
+            it = bz_item(d)
+            if it:
+                items.append(it)
+        time.sleep(1)
+    return items
+
+
+def bezrealitky_html():
+    params = [("offerType", "PRONAJEM"), ("estateType", "BYT"),
+              ("regionOsmIds", "R435514"),
+              ("osm_value", "Praha, Hlavní město Praha, Česko"),
+              ("currency", "CZK"), ("priceTo", PRICE_FURNISHED)]
+    params += [("disposition", d) for d in BEZ_DISPS]
+    last = None
+    for path in ("/vyhledat", "/vyhledavani"):
+        try:
+            items, seen_ids = [], set()
+            for page in range(1, MAX_PAGES + 1):
+                r = fetch("https://www.bezrealitky.cz" + path, params=params + [("page", page)])
+                data = next_data(r.text)
+                if data is None:
+                    raise RuntimeError("в HTML нет __NEXT_DATA__")
+                new = 0
+                for d in walk(data):
+                    if "uri" in d and "disposition" in d and "id" in d:
+                        if d["id"] in seen_ids:
+                            continue
+                        seen_ids.add(d["id"])
+                        new += 1
+                        it = bz_item(d)
+                        if it:
+                            items.append(it)
+                if new == 0:
+                    if page == 1:
+                        raise RuntimeError("на странице нет объявлений")
+                    break
+                time.sleep(1)
+            return items
+        except Exception as e:  # noqa: BLE001
+            last = RuntimeError(f"{path}: {e}")
+    raise last
+
+
+def bezrealitky():
+    return first_working("Bezrealitky", (bezrealitky_graphql, bezrealitky_html))
+
+
 def bezrealitky_detail(item):
-    r = S.get(item["url"], timeout=30)
-    r.raise_for_status()
+    r = fetch(item["url"])
     data = next_data(r.text)
     aid = item["id"].split(":", 1)[1]
     if data:
@@ -238,7 +366,7 @@ def bezrealitky_detail(item):
                 parts += strings_of(d)
         if parts:
             return " ".join(parts)
-    return re.sub(r"<[^>]+>", " ", r.text)
+    return page_text(r.text)
 
 
 DETAIL = {"Sreality": sreality_detail, "Bezrealitky": bezrealitky_detail}
@@ -317,7 +445,7 @@ def main():
         except Exception as e:  # noqa: BLE001
             print(f"{name} error: {e}")
             if not errors.get(name):
-                tg(f"⚠️ {name}: не удалось получить объявления — {e}")
+                tg(f"⚠️ {name}: не удалось получить объявления — {str(e)[:700]}")
             errors[name] = True
 
     sent = 0
