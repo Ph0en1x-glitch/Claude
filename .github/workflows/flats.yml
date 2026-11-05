@@ -2,7 +2,7 @@ name: flats
 
 on:
   schedule:
-    - cron: "7 * * * *"   # каждый час в :07 (по UTC)
+    - cron: "*/5 * * * *"   # каждые 5 минут (GitHub может опаздывать)
   workflow_dispatch:       # кнопка ручного запуска
 
 permissions:
@@ -15,7 +15,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +29,7 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FAST: "1"
         run: python flats.py
 
       - name: Save state
