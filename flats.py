@@ -156,7 +156,8 @@ def fetch(url, **kw):
     r = S.get(url, timeout=30, **kw)
     print(f"GET {r.status_code} {r.url[:170]}")
     if not r.ok:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]!r}")
+        body = "(HTML-страница)" if r.text.lstrip().startswith("<") else r.text[:150]
+        raise RuntimeError(f"HTTP {r.status_code} {r.url[:80]}: {body}")
     return r
 
 
@@ -244,38 +245,52 @@ def sr_candidate(d):
     }
 
 
+# На Sreality отдельного района "Praha 18" нет (404): Letňany, Čakovice там числятся
+# в "Praha 9". Поэтому 18-й район запрашивается через praha-9.
+SR_SLUG = {18: "praha-9"}
+
+
 def sreality():
-    items, seen_ids = [], set()
-    for district in DISTRICTS:
-        for page in range(1, SR_MAX_PAGES + 1):
-            r = fetch(f"https://www.sreality.cz/hledani/pronajem/byty/praha-{district}",
-                      params={"velikost": ",".join(SR_DISPS), "cena-do": PRICE_FURNISHED,
-                              "strana": page, "razeni": "nejnovejsi"})
-            data = next_data(r.text)
-            if not data:
-                t = re.search(r"<title>(.*?)</title>", r.text, re.S)
-                title = t.group(1).strip()[:60] if t else "-"
-                raise RuntimeError(f"Sreality: нет __NEXT_DATA__ (url={r.url[:90]}, "
-                                   f"title={title!r}, {len(r.text)} байт) — похоже на блокировку/страницу согласия")
-            new = 0
-            for d in walk(data):
-                it = sr_candidate(d)
-                if not it or it["id"] in seen_ids:
-                    continue
-                seen_ids.add(it["id"])
-                new += 1
-                it["locality"] = it["locality"] or f"Praha {district}"
-                items.append(it)
-            if new == 0:
-                if page == 1:
-                    pp = ((data.get("props") or {}).get("pageProps") or {})
-                    n_price = sum(1 for d in walk(data) if any(k.lower().startswith("price") for k in d))
-                    print(f"Sreality praha-{district}: объявлений не найдено; "
-                          f"ключи pageProps: {list(pp)[:8]}; словарей с price*: {n_price}")
-                break
-            time.sleep(1)
+    slugs = []
+    for d in DISTRICTS:
+        s = SR_SLUG.get(d, f"praha-{d}")
+        if s not in slugs:
+            slugs.append(s)
+    items, seen_ids, failures = [], set(), []
+    for sl in slugs:
+        try:
+            for page in range(1, SR_MAX_PAGES + 1):
+                r = fetch(f"https://www.sreality.cz/hledani/pronajem/byty/{sl}",
+                          params={"velikost": ",".join(SR_DISPS), "cena-do": PRICE_FURNISHED,
+                                  "strana": page, "razeni": "nejnovejsi"})
+                data = next_data(r.text)
+                if not data:
+                    t = re.search(r"<title>(.*?)</title>", r.text, re.S)
+                    title = t.group(1).strip()[:60] if t else "-"
+                    raise RuntimeError(f"нет __NEXT_DATA__ (url={r.url[:90]}, title={title!r}, "
+                                       f"{len(r.text)} байт) — похоже на блокировку/страницу согласия")
+                new = 0
+                for d in walk(data):
+                    it = sr_candidate(d)
+                    if not it or it["id"] in seen_ids:
+                        continue
+                    seen_ids.add(it["id"])
+                    new += 1
+                    it["locality"] = it["locality"] or sl.replace("-", " ").title()
+                    items.append(it)
+                if new == 0:
+                    if page == 1:
+                        pp = ((data.get("props") or {}).get("pageProps") or {})
+                        n_price = sum(1 for d in walk(data) if any(k.lower().startswith("price") for k in d))
+                        print(f"Sreality {sl}: объявлений не найдено; "
+                              f"ключи pageProps: {list(pp)[:8]}; словарей с price*: {n_price}")
+                    break
+                time.sleep(1)
+        except Exception as e:  # noqa: BLE001
+            print(f"Sreality {sl}: ошибка — {e}")
+            failures.append(f"{sl}: {e}")
     if not items:
-        raise RuntimeError("Sreality: ни одного объявления не распознано (структура страницы изменилась?)")
+        raise RuntimeError("Sreality: ни одного объявления не получено. " + " | ".join(failures)[:500])
     return items
 
 
@@ -465,14 +480,14 @@ def build_message(it, furnished, equip, balcony, pets=None):
     return "\n".join(lines)
 
 
-def tg(text):
+def tg(text, html=True):
     if not TOKEN or not CHAT_ID:
         print("--- (dry run, нет токена) ---\n" + text + "\n")
         return
     # TELEGRAM_CHAT_ID может содержать несколько ID через запятую: "111,222"
     for chat in [c.strip() for c in CHAT_ID.split(",") if c.strip()]:
         r = requests.post(f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-                          data={"chat_id": chat, "text": text, "parse_mode": "HTML"},
+                          data={"chat_id": chat, "text": text, **({"parse_mode": "HTML"} if html else {})},
                           timeout=30)
         if not r.ok:
             print("Telegram error:", r.status_code, r.text[:200])
@@ -500,14 +515,14 @@ def run_once():
             print(f"{name}: найдено кандидатов {len(got)}")
             candidates += got
             if errors.get(name):
-                tg(f"✅ {name}: снова работает")
+                tg(f"✅ {name}: снова работает", html=False)
             errors[name] = False
         except Exception as e:  # noqa: BLE001
             print(f"{name} error: {e}")
             last = errors.get(name)
             last = 0 if (last is True or not last) else last   # время последнего предупреждения
             if now - last > 6 * 3600:      # напоминаем об ошибке раз в 6 часов
-                tg(f"⚠️ {name}: не удалось получить объявления — {str(e)[:700]}")
+                tg(f"⚠️ {name}: не удалось получить объявления — {str(e)[:700]}", html=False)
                 last = now
             errors[name] = last or True
 
