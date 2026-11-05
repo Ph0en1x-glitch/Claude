@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Мониторинг аренды квартир в Праге 7/8/9/18: Sreality + Bezrealitky -> Telegram.
- 
+
 Запускается раз в час (GitHub Actions). Помнит уже обработанные объявления
 в state.json, поэтому дублей не будет.
 """
 import html as htmllib
 import json
 import os
+import random
 import re
 import time
 import unicodedata
 from pathlib import Path
- 
+
 import requests
- 
+
 # ====================== НАСТРОЙКИ ======================
 DISTRICTS = [7, 8, 9, 18]       # районы Праги (Praha 7, 8, 9, 18)
 PRICE_FURNISHED = 35000         # лимит, если мебель есть / не указана
@@ -23,11 +24,14 @@ MIN_EQUIP_MENTIONED = 0         # сколько из 4 (ванна/духовк
 SKIP_IF_NO_PETS = False         # True = не присылать, если явно написано "без животных"
 MAX_MESSAGES_PER_RUN = 20       # защита от потока сообщений
 MAX_DETAILS_PER_RUN = 60        # сколько страниц-деталей открывать за один запуск
-SR_MAX_PAGES = 8                # страниц Sreality на район (по ~22 объявления)
-MAX_PAGES = 5                   # страниц Bezrealitky
+# Быстрый режим (FAST=1): смотрим только самые свежие объявления, запросов мало,
+# можно запускать каждые несколько минут. Полный режим: все страницы.
+FAST = os.environ.get("FAST") == "1"
+SR_MAX_PAGES = 2 if FAST else 8   # страниц Sreality на район (по ~22 объявления)
+MAX_PAGES = 1 if FAST else 5      # страниц Bezrealitky (по 60 объявлений)
 STATE_FILE = Path("state.json")
 SEEN_TTL_DAYS = 120
- 
+
 # Районы (кадастровые части), относящиеся к Praha 7/8/9/18. Нужны ТОЛЬКО для
 # Bezrealitky: там в адресе часто нет номера района ("Praha - Libeň").
 # Список приблизительный, правь под себя.
@@ -39,15 +43,15 @@ BZ_AREAS = {
         "Černý Most", "Kyje", "Hostavice"],
     18: ["Letňany", "Čakovice"],
 }
- 
+
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
- 
+
 # Диспозиции: 1+1, 2+kk, 2+1, 3+kk, 3+1, 4+kk, 4+1, 5+kk, 5+1
 ALLOWED_DISP = {"1+1", "2+kk", "2+1", "3+kk", "3+1", "4+kk", "4+1", "5+kk", "5+1"}
 BEZ_DISPS = ["DISP_1_1", "DISP_2_KK", "DISP_2_1", "DISP_3_KK", "DISP_3_1",
              "DISP_4_KK", "DISP_4_1", "DISP_5_KK", "DISP_5_1"]
- 
+
 # Ключевые слова (текст приводится к нижнему регистру и без диакритики)
 EQUIP = {
     "ванна": r"\bvan(a|u|y|e|ou|ova|ove|ovou)\b|vanou|bathtub",
@@ -64,21 +68,21 @@ PETS_AGREEMENT = (r"(zvirat|mazlic)\w* (po dohode|dle dohody|po domluve|dle doml
                   r"(po dohode|po domluve).{0,25}(zvirat|mazlic)")
 PETS_OK = (r"(zvirat|mazlic)\w* (povolen|vitan|mozn|ok\b)|pet.?friendly|pets? allowed|"
            r"se zviraty|s mazlicky|s domacimi zviraty")
- 
+
 S = requests.Session()
 S.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept-Language": "cs,en;q=0.8",
 })
- 
- 
+
+
 # ====================== УТИЛИТЫ ======================
 def norm(s):
     s = unicodedata.normalize("NFKD", str(s).lower())
     return "".join(c for c in s if not unicodedata.combining(c))
- 
- 
+
+
 def walk(o):
     if isinstance(o, dict):
         yield o
@@ -87,8 +91,8 @@ def walk(o):
     elif isinstance(o, list):
         for v in o:
             yield from walk(v)
- 
- 
+
+
 def getf(d, name):
     """Поле словаря; учитывает ключи Apollo вида 'address({"locale":"CS"})'."""
     if name in d:
@@ -97,13 +101,13 @@ def getf(d, name):
         if k.startswith(name + "("):
             return v
     return None
- 
- 
+
+
 def next_data(page_html):
     m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', page_html, re.S)
     return json.loads(m.group(1)) if m else None
- 
- 
+
+
 def furnished_token(v):
     if isinstance(v, bool):
         return "zarizeny" if v else "nezarizeny"
@@ -115,11 +119,11 @@ def furnished_token(v):
     if "part" in t or "castecne" in t:
         return "castecne zarizeny"
     return t
- 
- 
+
+
 SKIP_KEYS = ("similar", "recommend", "related", "nearby", "otheradvert")
- 
- 
+
+
 def strings_of(d, depth=0):
     """Все строки словаря (включая вложенные) + имена булевых полей со значением True."""
     out = []
@@ -142,25 +146,25 @@ def strings_of(d, depth=0):
                 elif isinstance(x, dict):
                     out += strings_of(x, depth + 1)
     return out
- 
- 
+
+
 def money(v):
     return f"{int(v):,}".replace(",", " ")
- 
- 
+
+
 def fetch(url, **kw):
     r = S.get(url, timeout=30, **kw)
     print(f"GET {r.status_code} {r.url[:170]}")
     if not r.ok:
         raise RuntimeError(f"HTTP {r.status_code}: {r.text[:150]!r}")
     return r
- 
- 
+
+
 def page_text(page_html):
     t = re.sub(r"(?s)<(script|style)[^>]*>.*?</\1>", " ", page_html)
     return re.sub(r"<[^>]+>", " ", t)
- 
- 
+
+
 def first_working(name, strategies):
     errs = []
     for fn in strategies:
@@ -173,22 +177,43 @@ def first_working(name, strategies):
         except Exception as e:  # noqa: BLE001
             errs.append(f"{fn.__name__}: {e}")
     raise RuntimeError(" | ".join(errs)[:900])
- 
- 
+
+
 # ====================== SREALITY ======================
 # Публичный JSON API Sreality закрыт (404/401), но страница поиска содержит
 # все данные в <script id="__NEXT_DATA__">. Читаем их оттуда.
 SR_DISPS = ["1+1", "2+kk", "2+1", "3+kk", "3+1", "4+kk", "4+1", "5+kk", "5+1"]
- 
- 
+
+
 def find_detail_url(d):
     for v in walk(d):
         for x in v.values():
             if isinstance(x, str) and ("/detail/" in x) and (x.startswith("/") or "sreality.cz" in x):
                 return "https://www.sreality.cz" + x if x.startswith("/") else x
     return None
- 
- 
+
+
+def slug(s):
+    return re.sub(r"[^a-z0-9]+", "-", norm(s)).strip("-")
+
+
+def sr_locality(d):
+    loc = d.get("locality")
+    src_d = loc if isinstance(loc, dict) else {}
+    parts = []
+    for key in ("street", "cityPart", "district", "city"):
+        v = src_d.get(key) or d.get(key)
+        if isinstance(v, str) and v and v not in parts:
+            parts.append(v)
+    if parts:
+        return ", ".join(parts)
+    if isinstance(loc, str):
+        return loc
+    if isinstance(loc, dict):
+        return ", ".join(str(v) for v in loc.values() if isinstance(v, str))
+    return ""
+
+
 def sr_candidate(d):
     hid = d.get("hash_id", d.get("hashId", d.get("id")))
     if hid is None or not any(k in d for k in ("priceCzk", "price_czk", "price")):
@@ -198,28 +223,27 @@ def sr_candidate(d):
         return None
     if "pronajem" not in norm(name):
         return None
-    m = re.search(r"\d\+(?:kk|\d)", name, re.I)
-    if not m or m.group(0).lower() not in ALLOWED_DISP:
+    m = re.search(r"\d\+(?:kk|kt|\d)", name, re.I)
+    if not m or m.group(0).lower().replace("kt", "kk") not in ALLOWED_DISP:
         return None
     price = d.get("priceCzk") or d.get("price_czk") or d.get("price")
     if isinstance(price, dict):
         price = price.get("value_raw") or price.get("value")
     if not isinstance(price, (int, float)) or price <= 0:
         return None
-    loc = d.get("locality")
-    if isinstance(loc, dict):
-        loc = ", ".join(str(v) for v in loc.values() if isinstance(v, str))
-    if not isinstance(loc, str):
-        loc = d.get("cityPart") if isinstance(d.get("cityPart"), str) else ""
-    disp = m.group(0).lower()
-    url = find_detail_url(d) or f"https://www.sreality.cz/detail/pronajem/byt/{disp}/praha/{hid}"
+    loc = sr_locality(d)
+    disp = m.group(0).lower().replace("kt", "kk")
+    cp = (d.get("locality") or {}).get("cityPart") if isinstance(d.get("locality"), dict) else None
+    cp = cp or d.get("cityPart")
+    area = "praha-" + slug(cp) if isinstance(cp, str) and cp else "praha"
+    url = find_detail_url(d) or f"https://www.sreality.cz/detail/pronajem/byt/{disp}/{area}/{hid}"
     return {
         "id": f"sr:{hid}", "source": "Sreality", "ref": str(hid),
         "title": name, "locality": loc, "price": int(price), "charges": None,
         "text": f"{name} {loc}", "url": url,
     }
- 
- 
+
+
 def sreality():
     items, seen_ids = [], set()
     for district in DISTRICTS:
@@ -229,7 +253,10 @@ def sreality():
                               "strana": page, "razeni": "nejnovejsi"})
             data = next_data(r.text)
             if not data:
-                raise RuntimeError("Sreality: в HTML нет __NEXT_DATA__ (блокировка/страница согласия?)")
+                t = re.search(r"<title>(.*?)</title>", r.text, re.S)
+                title = t.group(1).strip()[:60] if t else "-"
+                raise RuntimeError(f"Sreality: нет __NEXT_DATA__ (url={r.url[:90]}, "
+                                   f"title={title!r}, {len(r.text)} байт) — похоже на блокировку/страницу согласия")
             new = 0
             for d in walk(data):
                 it = sr_candidate(d)
@@ -250,8 +277,8 @@ def sreality():
     if not items:
         raise RuntimeError("Sreality: ни одного объявления не распознано (структура страницы изменилась?)")
     return items
- 
- 
+
+
 def sreality_detail(item):
     r = fetch(item["url"])
     data = next_data(r.text)
@@ -263,8 +290,8 @@ def sreality_detail(item):
         if parts:
             return " ".join(parts)
     return page_text(r.text)
- 
- 
+
+
 # ====================== BEZREALITKY ======================
 def bz_in_districts(address):
     a = norm(address)
@@ -278,8 +305,8 @@ def bz_in_districts(address):
             if norm(area) in a:
                 return True
     return False
- 
- 
+
+
 def bz_item(d):
     if not ("uri" in d and "disposition" in d and "id" in d):
         return None
@@ -303,8 +330,8 @@ def bz_item(d):
         "text": " ".join(strings_of(d)),
         "url": f"https://www.bezrealitky.cz/nemovitosti-byty-domy/{d['uri']}",
     }
- 
- 
+
+
 def bezrealitky_graphql():
     items, seen_ids = [], set()
     disp = ", ".join(BEZ_DISPS)
@@ -336,8 +363,8 @@ def bezrealitky_graphql():
                 items.append(it)
         time.sleep(1)
     return items
- 
- 
+
+
 def bezrealitky_html():
     params = [("offerType", "PRONAJEM"), ("estateType", "BYT"),
               ("regionOsmIds", "R435514"),
@@ -372,12 +399,12 @@ def bezrealitky_html():
         except Exception as e:  # noqa: BLE001
             last = RuntimeError(f"{path}: {e}")
     raise last
- 
- 
+
+
 def bezrealitky():
     return first_working("Bezrealitky", (bezrealitky_graphql, bezrealitky_html))
- 
- 
+
+
 def bezrealitky_detail(item):
     r = fetch(item["url"])
     data = next_data(r.text)
@@ -390,11 +417,11 @@ def bezrealitky_detail(item):
         if parts:
             return " ".join(parts)
     return page_text(r.text)
- 
- 
+
+
 DETAIL = {"Sreality": sreality_detail, "Bezrealitky": bezrealitky_detail}
- 
- 
+
+
 # ====================== ЛОГИКА ======================
 def analyze(text):
     t = norm(text)
@@ -415,8 +442,8 @@ def analyze(text):
     else:
         pets = None
     return furnished, equip, balcony, pets
- 
- 
+
+
 def build_message(it, furnished, equip, balcony, pets=None):
     mark = lambda ok: "✅" if ok else "❓"
     esc = htmllib.escape
@@ -436,8 +463,8 @@ def build_message(it, furnished, equip, balcony, pets=None):
         "❓ = в тексте не упомянуто, проверь в объявлении",
     ]
     return "\n".join(lines)
- 
- 
+
+
 def tg(text):
     if not TOKEN or not CHAT_ID:
         print("--- (dry run, нет токена) ---\n" + text + "\n")
@@ -448,9 +475,9 @@ def tg(text):
                           data={"chat_id": chat, "text": text, "parse_mode": "HTML"},
                           timeout=30)
         if not r.ok:
-            print(f"Telegram error (chat {chat}):", r.status_code, r.text)
- 
- 
+            print("Telegram error:", r.status_code, r.text[:200])
+
+
 def load_state():
     if STATE_FILE.exists():
         try:
@@ -458,14 +485,14 @@ def load_state():
         except Exception:
             pass
     return {}
- 
- 
-def main():
+
+
+def run_once():
     state = load_state()
     seen = state.setdefault("seen", {})
     errors = state.setdefault("errors", {})
     now = int(time.time())
- 
+
     candidates = []
     for name, fn in (("Sreality", sreality), ("Bezrealitky", bezrealitky)):
         try:
@@ -477,10 +504,13 @@ def main():
             errors[name] = False
         except Exception as e:  # noqa: BLE001
             print(f"{name} error: {e}")
-            if not errors.get(name):
+            last = errors.get(name)
+            last = 0 if (last is True or not last) else last   # время последнего предупреждения
+            if now - last > 6 * 3600:      # напоминаем об ошибке раз в 6 часов
                 tg(f"⚠️ {name}: не удалось получить объявления — {str(e)[:700]}")
-            errors[name] = True
- 
+                last = now
+            errors[name] = last or True
+
     sent = details = 0
     for it in candidates:
         if it["id"] in seen:
@@ -509,13 +539,27 @@ def main():
         tg(build_message(it, furnished, equip, balcony, pets))
         sent += 1
         time.sleep(0.5)
- 
+
     cutoff = now - SEEN_TTL_DAYS * 86400
     state["seen"] = {k: v for k, v in seen.items() if v >= cutoff}
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=1), "utf-8")
     print(f"Готово: отправлено {sent}, открыто деталей {details}, кандидатов {len(candidates)}")
- 
- 
+
+
+def main():
+    # LOOP_SECONDS=180 -> работать бесконечно, проверяя сайты каждые ~3 минуты
+    # (для домашнего компьютера / сервера). Без переменной: один проход.
+    loop = int(os.environ.get("LOOP_SECONDS", "0") or 0)
+    if not loop:
+        run_once()
+        return
+    while True:
+        try:
+            run_once()
+        except Exception as e:  # noqa: BLE001
+            print("Ошибка цикла:", e)
+        time.sleep(loop + random.randint(0, 30))
+
+
 if __name__ == "__main__":
     main()
- 
